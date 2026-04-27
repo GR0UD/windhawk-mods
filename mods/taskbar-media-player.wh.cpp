@@ -433,6 +433,42 @@ static constexpr double LUM_DARK_THRESHOLD = 135.0;
 // Pi — used in FFT twiddle factors and Hann window.
 static constexpr float PI = 3.14159265f;
 
+// ============================================================================
+//  Diagnostic helpers
+// ============================================================================
+
+// Replaces silent catch(...) blocks throughout the file.
+// In a shipped mod we still swallow exceptions, but now every failure
+// leaves a trace in the Windhawk log so subtle bugs are actually findable.
+//
+// Usage:
+//   WH_TRY { ... risky WinRT call ... } WH_CATCH("context description")
+//
+#define WH_CATCH(ctx)                                                      \
+    catch (winrt::hresult_error const& e) {                                \
+        Wh_Log(L"[" ctx L"] hresult 0x%08X: %s", (unsigned)e.code().value, \
+               e.message().c_str());                                       \
+    }                                                                      \
+    catch (std::exception const& e) {                                      \
+        Wh_Log(L"[" ctx L"] std::exception (see debug log)");              \
+        (void)e;                                                           \
+    }                                                                      \
+    catch (...) {                                                          \
+        Wh_Log(L"[" ctx L"] unknown exception");                           \
+    }
+
+// Convenience: single-expression try/catch that logs and returns a default.
+// Use for expressions that return a value, e.g.:
+//   wstring s = WH_TRY_OR(props.Title().c_str(), L"Unknown");
+#define WH_TRY_OR(expr, fallback) \
+    [&]() noexcept {              \
+        try {                     \
+            return (expr);        \
+        } catch (...) {           \
+            return (fallback);    \
+        }                         \
+    }()
+
 // Media command identifiers — used by Cmd() and HitTestControls().
 enum class MediaCmd : int {
     None = 0,
@@ -710,16 +746,78 @@ struct ThemeCache {
     DWORD tickStamp = 0;
 };
 
-struct AnimState {
-    float textFadeAlpha = 1.f;
-    bool textFadeOut = false;
+// ── Text crossfade ──────────────────────────────────────────────────────────
+// Owns the contract between FetchMedia and IDT_TEXT_FADE.
+//
+// Ownership rules (all on the message-loop thread — no lock needed):
+//   FetchMedia  → calls RequestSwap()  to arm a pending transition.
+//   IDT_TEXT_FADE → calls Tick() each frame; commits the swap when alpha==0;
+//                   clears fadeOut once the fade-in completes.
+//   DrawInfoContainer → reads alpha and whichever title g_M currently holds.
+//
+// g_M.title / g_M.artist are ONLY written by CommitPending() (called from
+// Tick), never by FetchMedia directly.  This removes the implicit coupling
+// where FetchMedia needed to know whether an animation was already running.
+struct TextCrossfade {
+    float alpha = 1.f;     // 1=fully visible, 0=fully hidden
+    bool fadeOut = false;  // true during fade-out; false during fade-in
+    bool active = false;   // any crossfade phase in progress
+
     wstring pendingTitle;
     wstring pendingArtist;
 
-    float hoverProgress[7] = {};  // index 1-6
+    // Called by FetchMedia when a track change is detected.
+    // Idempotent: re-arming for the same pending title is a no-op.
+    void RequestSwap(const wstring& newTitle, const wstring& newArtist) {
+        if (fadeOut && pendingTitle == newTitle)
+            return;  // already fading to this title
+        pendingTitle = newTitle;
+        pendingArtist = newArtist;
+        fadeOut = true;
+        active = true;
+    }
+
+    // Called once per IDT_TEXT_FADE tick.
+    // Returns true if a repaint is needed.
+    // outCommit is set to {title,artist} when the swap should be written to
+    // g_M.
+    struct CommitData {
+        wstring title, artist;
+    };
+    bool Tick(CommitData* outCommit) {
+        static constexpr float STEP = 0.12f;
+        if (fadeOut) {
+            alpha = max(0.f, alpha - STEP);
+            if (alpha <= 0.f) {
+                alpha = 0.f;
+                fadeOut = false;
+                // Signal caller to commit the pending strings to g_M.
+                if (outCommit) {
+                    outCommit->title = pendingTitle;
+                    outCommit->artist = pendingArtist;
+                }
+            }
+        } else {
+            alpha = min(1.f, alpha + STEP);
+            if (alpha >= 1.f) {
+                alpha = 1.f;
+                active = false;  // crossfade complete
+            }
+        }
+        return true;  // always repaint while active
+    }
+};
+
+struct AnimState {
+    TextCrossfade crossfade;  // owns the full text-swap lifecycle
+
+    // NOTE: hoverProgress and the window fade fields are accessed ONLY from
+    // the message-loop thread (timer callbacks + WndProc).  No mutex is
+    // needed; document this explicitly so reviewers don't add one later.
+    float hoverProgress[7] = {};  // index 1-6, message-loop-only
     bool hoverAnimRunning = false;
 
-    float fadeAlpha = 1.f;
+    float fadeAlpha = 1.f;  // message-loop-only
     bool fadeIn = true;
     bool fadeActive = false;
 };
@@ -1820,8 +1918,21 @@ static void UpdateVisualizerPeaks() {
 //  Media state
 // ============================================================================
 
+// Lock discipline for MediaSnap:
+//   - FetchMedia runs on the message-loop thread and holds mtx while writing
+//     title, artist, playing, hasMedia, shuffleOn, repeatMode.
+//   - art, primaryColor, secondaryColor, isDarkCover are written only by
+//     FetchMedia and read only by DrawPanel — both on the message-loop thread
+//     — so they don't need the lock.  This is annotated per-field below.
+//   - The crossfade commit (title/artist swap at alpha==0) also runs on the
+//     message-loop thread and does take the lock for consistency with readers
+//     that come from timer callbacks fired on the same thread.
+//
+// Because everything is message-loop-only the mutex never actually contends;
+// it exists as a correctness backstop against future off-thread readers.
 struct MediaSnap {
-    wstring title = L"No Media";
+    // ── Lock-protected fields (use g_M.mtx) ─────────────────────────────────
+    wstring title = L"No Media";  // current displayed title
     wstring artist = L"";
     bool playing = false;
     bool hasMedia = false;
@@ -1829,12 +1940,27 @@ struct MediaSnap {
     int repeatMode = 0;  // 0=None 1=Track 2=List
     INT64 timelinePos = 0;
     INT64 timelineEnd = 0;
-    unique_ptr<Bitmap> art;
-    Color primaryColor = Color(255, 18, 18, 18);
-    Color secondaryColor = Color(255, 45, 45, 45);
-    bool isDarkCover = true;
     mutex mtx;
+
+    // ── Message-loop-only fields (no lock required) ──────────────────────────
+    unique_ptr<Bitmap> art;                         // ml-only
+    Color primaryColor = Color(255, 18, 18, 18);    // ml-only
+    Color secondaryColor = Color(255, 45, 45, 45);  // ml-only
+    bool isDarkCover = true;                        // ml-only
 } g_M;
+
+// Convenience RAII wrappers so lock sites are obviously paired.
+// Usage: { MediaWriter w; w->playing = true; }
+struct MediaReader {
+    explicit MediaReader() { g_M.mtx.lock(); }
+    ~MediaReader() { g_M.mtx.unlock(); }
+    MediaSnap* operator->() { return &g_M; }
+};
+struct MediaWriter {
+    explicit MediaWriter() { g_M.mtx.lock(); }
+    ~MediaWriter() { g_M.mtx.unlock(); }
+    MediaSnap* operator->() { return &g_M; }
+};
 
 static wstring g_currentMediaAppAumid;
 
@@ -1972,8 +2098,8 @@ static Bitmap* ToBitmap(IRandomAccessStreamWithContentType const& s) {
                 return b;
             delete b;
         }
-    } catch (...) {
     }
+    WH_CATCH(L"ToBitmap")
     return nullptr;
 }
 
@@ -2090,232 +2216,304 @@ static void SetVolume(float level) {
 //  Media fetch
 // ============================================================================
 
-static void FetchMedia() {
-    try {
-        if (!g_Mgr)
-            g_Mgr =
-                GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
-                    .get();
-        if (!g_Mgr)
-            return;
+// ============================================================================
+//  Media fetch — decomposed
+// ============================================================================
+//
+// FetchMedia() is the public entry point called from IDT_POLL.  It delegates
+// to four focused helpers so each concern can be read, tested, and reasoned
+// about independently:
+//
+//   SelectSession()        — pick the right GSMTC session (priority + filter)
+//   FetchAlbumArt()        — decode thumbnail, update aspect ratio & palette
+//   FetchPlaybackState()   — playing flag, shuffle, repeat mode
+//   FetchTimeline()        — position + duration → g_Progress
+//
+// g_M.mtx is held only for the fields that are written here and read by
+// message-loop timer callbacks.  The lock comments above g_M's declaration
+// are the authoritative ownership contract.
 
-        auto sessions = g_Mgr.GetSessions();
-        GlobalSystemMediaTransportControlsSession ses = nullptr;
+// ── 4a. Session selection ────────────────────────────────────────────────────
+// Returns the session to use this poll cycle, or nullptr.
+static GlobalSystemMediaTransportControlsSession SelectSession() {
+    if (!g_Mgr) {
+        try {
+            g_Mgr = GlobalSystemMediaTransportControlsSessionManager ::
+                        RequestAsync()
+                            .get();
+        }
+        WH_CATCH(L"SelectSession/RequestAsync")
+        if (!g_Mgr)
+            return nullptr;
+    }
 
-        // Priority: playing session
+    auto sessions = g_Mgr.GetSessions();
+    GlobalSystemMediaTransportControlsSession ses = nullptr;
+
+    // Priority: a playing session.
+    for (auto const& s : sessions) {
+        try {
+            using S = GlobalSystemMediaTransportControlsSessionPlaybackStatus;
+            if (s && s.GetPlaybackInfo().PlaybackStatus() == S::Playing) {
+                ses = s;
+                break;
+            }
+        }
+        WH_CATCH(L"SelectSession/playingLoop")
+    }
+
+    // Filter by focused app if configured (overrides the playing-first pick).
+    if (!g_US.focusedApp.empty()) {
+        ses = nullptr;
+        wstring lf = g_US.focusedApp;
+        transform(lf.begin(), lf.end(), lf.begin(), ::towlower);
+        if (lf.size() > 4 && lf.substr(lf.size() - 4) == L".exe")
+            lf = lf.substr(0, lf.size() - 4);
         for (auto const& s : sessions) {
             try {
-                if (s &&
-                    s.GetPlaybackInfo().PlaybackStatus() ==
-                        GlobalSystemMediaTransportControlsSessionPlaybackStatus::
-                            Playing) {
+                wstring id = s.SourceAppUserModelId().c_str();
+                transform(id.begin(), id.end(), id.begin(), ::towlower);
+                if (id.find(lf) != wstring::npos) {
                     ses = s;
                     break;
                 }
-            } catch (...) {
             }
+            WH_CATCH(L"SelectSession/filterLoop")
         }
+    }
 
-        // Filter by focused app if set
-        if (!g_US.focusedApp.empty()) {
-            ses = nullptr;
-            wstring lf = g_US.focusedApp;
-            transform(lf.begin(), lf.end(), lf.begin(), ::towlower);
-            if (lf.size() > 4 && lf.substr(lf.size() - 4) == L".exe")
-                lf = lf.substr(0, lf.size() - 4);
-            for (auto const& s : sessions) {
-                try {
-                    wstring id = s.SourceAppUserModelId().c_str();
-                    transform(id.begin(), id.end(), id.begin(), ::towlower);
-                    if (id.find(lf) != wstring::npos) {
-                        ses = s;
-                        break;
-                    }
-                } catch (...) {
-                }
-            }
+    // Fallback: whatever the OS considers current.
+    if (!ses) {
+        try {
+            ses = g_Mgr.GetCurrentSession();
         }
+        WH_CATCH(L"SelectSession/GetCurrentSession")
+    }
 
-        // Fallback: last active session
-        if (!ses)
+    return ses;
+}
+
+// ── 4b. Album art + palette ──────────────────────────────────────────────────
+// Precondition: called on the message-loop thread; g_M.mtx is NOT held.
+// Writes to the ml-only fields (art, primaryColor, secondaryColor,
+// isDarkCover) and to the unlocked globals g_ArtAspectRatio / g_ArtVersion.
+static void FetchAlbumArt(
+    GlobalSystemMediaTransportControlsSessionMediaProperties const& props) {
+    g_M.art.reset();
+    try {
+        auto ref = props.Thumbnail();
+        if (ref) {
+            auto stream = ref.OpenReadAsync().get();
+            if (stream)
+                g_M.art.reset(ToBitmap(stream));
+        }
+    }
+    WH_CATCH(L"FetchAlbumArt/decode")
+
+    ++g_ArtVersion;
+
+    // Aspect ratio for layout auto-sizing.
+    if (g_M.art) {
+        UINT natW = g_M.art->GetWidth(), natH = g_M.art->GetHeight();
+        g_ArtAspectRatio = (natH > 0) ? (float)natW / (float)natH : 1.f;
+    } else {
+        g_ArtAspectRatio = 1.f;
+    }
+    g_LayoutDirty = true;
+
+    // Cover luminance — determines whether overlaid text should be light/dark.
+    g_M.isDarkCover = true;
+    if (g_M.art) {
+        try {
+            Bitmap px1(1, 1, PixelFormat32bppARGB);
+            Graphics pg(&px1);
+            pg.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+            pg.DrawImage(g_M.art.get(), 0, 0, 1, 1);
+            Color avg;
+            px1.GetPixel(0, 0, &avg);
+            double lum =
+                0.299 * avg.GetR() + 0.587 * avg.GetG() + 0.114 * avg.GetB();
+            g_M.isDarkCover = (lum < LUM_DARK_THRESHOLD);
+        }
+        WH_CATCH(L"FetchAlbumArt/luminance")
+    }
+
+    auto pal = GetAlbumPalette(g_M.art.get());
+    g_M.primaryColor = pal.primary;
+    g_M.secondaryColor = pal.secondary;
+}
+
+// ── 4c. Playback state ───────────────────────────────────────────────────────
+// Writes g_M.playing, g_M.shuffleOn, g_M.repeatMode under g_M.mtx.
+// Also syncs g_Progress.isPlaying when the playing flag changes.
+static void FetchPlaybackState(
+    GlobalSystemMediaTransportControlsSession const& ses) {
+    try {
+        auto pbi = ses.GetPlaybackInfo();
+        using S = GlobalSystemMediaTransportControlsSessionPlaybackStatus;
+        bool nowPlaying = (pbi.PlaybackStatus() == S::Playing);
+
+        {
+            MediaWriter w;
+            w->playing = nowPlaying;
+
+            // Sync progress interpolation origin whenever play state toggles.
+            if (nowPlaying != g_Progress.isPlaying) {
+                g_Progress.isPlaying = nowPlaying;
+                g_Progress.updateTick = GetTickCount();
+                g_Progress.lastRawPos = w->timelinePos;
+            }
+
             try {
-                ses = g_Mgr.GetCurrentSession();
-            } catch (...) {
+                w->shuffleOn = pbi.IsShuffleActive()
+                                   ? pbi.IsShuffleActive().Value()
+                                   : false;
             }
-
-        if (ses) {
-            // ── Media properties ─────────────────────────────────────────────
-            GlobalSystemMediaTransportControlsSessionMediaProperties props =
-                nullptr;
-            try {
-                props = ses.TryGetMediaPropertiesAsync().get();
-            } catch (...) {
-                scoped_lock lk(g_M.mtx);
-                g_M.playing = false;
-                return;
-            }
-            if (!props) {
-                scoped_lock lk(g_M.mtx);
-                g_M.playing = false;
-                return;
-            }
+            WH_CATCH(L"FetchPlaybackState/shuffle")
 
             try {
-                g_currentMediaAppAumid = ses.SourceAppUserModelId().c_str();
-            } catch (...) {
-            }
-            FetchAppVolume();
-
-            scoped_lock lk(g_M.mtx);
-            wstring nt = L"Unknown";
-            try {
-                nt = props.Title().c_str();
-            } catch (...) {
-            }
-
-            if (nt != g_M.title || !g_M.art) {
-                // Track changed — trigger text crossfade.
-                // Skip if a fade-out is already running for the same new title
-                // (can happen because g_M.title is intentionally not updated
-                // until the fade-out completes, so every subsequent poll would
-                // see nt != g_M.title and re-trigger otherwise).
-                bool alreadyFading =
-                    g_Anim.textFadeOut && g_Anim.pendingTitle == nt;
-                if (nt != g_M.title && g_M.title != L"No Media" &&
-                    !alreadyFading) {
-                    g_Anim.pendingTitle = nt;
-                    try {
-                        g_Anim.pendingArtist = props.Artist().c_str();
-                    } catch (...) {
-                    }
-                    g_Anim.textFadeOut = true;
-                    if (g_hWnd)
-                        g_Timers.Set(g_hWnd, IDT_TEXT_FADE, 16);
-                }
-                g_M.art.reset();
-                try {
-                    auto ref = props.Thumbnail();
-                    if (ref) {
-                        auto stream = ref.OpenReadAsync().get();
-                        if (stream)
-                            g_M.art.reset(ToBitmap(stream));
-                    }
-                } catch (...) {
-                }
-                ++g_ArtVersion;
-
-                // Aspect ratio for auto-size
-                if (g_M.art) {
-                    UINT natW = g_M.art->GetWidth(),
-                         natH = g_M.art->GetHeight();
-                    g_ArtAspectRatio =
-                        (natH > 0) ? (float)natW / (float)natH : 1.0f;
-                } else {
-                    g_ArtAspectRatio = 1.0f;
-                }
-                g_LayoutDirty = true;
-
-                // Cover brightness (for mask adaptation)
-                if (g_M.art) {
-                    Bitmap px1(1, 1, PixelFormat32bppARGB);
-                    Graphics pg(&px1);
-                    pg.SetInterpolationMode(
-                        InterpolationModeHighQualityBicubic);
-                    pg.DrawImage(g_M.art.get(), 0, 0, 1, 1);
-                    Color avg;
-                    px1.GetPixel(0, 0, &avg);
-                    double lum = 0.299 * avg.GetR() + 0.587 * avg.GetG() +
-                                 0.114 * avg.GetB();
-                    g_M.isDarkCover = (lum < LUM_DARK_THRESHOLD);
-                }
-
-                auto pal = GetAlbumPalette(g_M.art.get());
-                g_M.primaryColor = pal.primary;
-                g_M.secondaryColor = pal.secondary;
-            }
-
-            // Only update title/artist immediately if no crossfade is running.
-            // When a crossfade was just triggered the old text must stay
-            // visible during the fade-out phase; the IDT_TEXT_FADE handler will
-            // swap in the pending (new) values once the alpha reaches zero.
-            if (!g_Anim.textFadeOut) {
-                g_M.title = nt;
-                try {
-                    g_M.artist = props.Artist().c_str();
-                } catch (...) {
-                    g_M.artist = L"";
+                auto rm = pbi.AutoRepeatMode();
+                if (rm) {
+                    using RM = Windows::Media::MediaPlaybackAutoRepeatMode;
+                    auto v = rm.Value();
+                    w->repeatMode = (v == RM::Track)  ? 1
+                                    : (v == RM::List) ? 2
+                                                      : 0;
                 }
             }
-
-            // ── Playback state
-            // ────────────────────────────────────────────────
-            try {
-                auto pbi = ses.GetPlaybackInfo();
-                bool nowPlaying =
-                    (pbi.PlaybackStatus() ==
-                     GlobalSystemMediaTransportControlsSessionPlaybackStatus::
-                         Playing);
-                g_M.playing = nowPlaying;
-                if (nowPlaying != g_Progress.isPlaying) {
-                    g_Progress.isPlaying = nowPlaying;
-                    g_Progress.updateTick = GetTickCount();
-                    g_Progress.lastRawPos = g_M.timelinePos;
-                }
-                try {
-                    g_M.shuffleOn = pbi.IsShuffleActive()
-                                        ? pbi.IsShuffleActive().Value()
-                                        : false;
-                } catch (...) {
-                }
-                try {
-                    auto rm = pbi.AutoRepeatMode();
-                    if (rm) {
-                        using RM = Windows::Media::MediaPlaybackAutoRepeatMode;
-                        auto v = rm.Value();
-                        g_M.repeatMode = (v == RM::Track)  ? 1
-                                         : (v == RM::List) ? 2
-                                                           : 0;
-                    }
-                } catch (...) {
-                }
-            } catch (...) {
-                g_M.playing = false;
-            }
-
-            // ── Timeline / progress
-            // ───────────────────────────────────────────
-            try {
-                auto tl = ses.GetTimelineProperties();
-                INT64 newPos = tl.Position().count();
-                INT64 newEnd = tl.EndTime().count();
-                g_M.timelinePos = newPos;
-                g_M.timelineEnd = newEnd;
-                bool nowP = g_M.playing;
-                if (newPos != g_Progress.lastRawPos ||
-                    newEnd != g_Progress.endRaw ||
-                    nowP != g_Progress.isPlaying) {
-                    g_Progress.lastRawPos = newPos;
-                    g_Progress.endRaw = newEnd;
-                    g_Progress.updateTick = GetTickCount();
-                    g_Progress.isPlaying = nowP;
-                }
-            } catch (...) {
-                g_M.timelinePos = g_M.timelineEnd = 0;
-            }
-
-            g_M.hasMedia = true;
-        } else {
-            scoped_lock lk(g_M.mtx);
-            g_M.playing = false;
-            g_M.hasMedia = false;
-            g_Vol.cachedIface = nullptr;
-            g_Vol.cachedAumid.clear();
+            WH_CATCH(L"FetchPlaybackState/repeat")
         }
     } catch (...) {
-        scoped_lock lk(g_M.mtx);
-        g_M.playing = false;
-        g_M.hasMedia = false;
+        Wh_Log(L"[FetchPlaybackState] failed — marking paused");
+        MediaWriter w;
+        w->playing = false;
     }
+}
+
+// ── 4d. Timeline / progress ──────────────────────────────────────────────────
+// Writes g_M.timelinePos/End and syncs g_Progress under g_M.mtx.
+static void FetchTimeline(
+    GlobalSystemMediaTransportControlsSession const& ses) {
+    try {
+        auto tl = ses.GetTimelineProperties();
+        INT64 newPos = tl.Position().count();
+        INT64 newEnd = tl.EndTime().count();
+
+        MediaWriter w;
+        w->timelinePos = newPos;
+        w->timelineEnd = newEnd;
+        bool nowP = w->playing;
+
+        if (newPos != g_Progress.lastRawPos || newEnd != g_Progress.endRaw ||
+            nowP != g_Progress.isPlaying) {
+            g_Progress.lastRawPos = newPos;
+            g_Progress.endRaw = newEnd;
+            g_Progress.updateTick = GetTickCount();
+            g_Progress.isPlaying = nowP;
+        }
+    } catch (...) {
+        Wh_Log(L"[FetchTimeline] failed — resetting timeline");
+        MediaWriter w;
+        w->timelinePos = w->timelineEnd = 0;
+    }
+}
+
+// ── 4e. Orchestrator ─────────────────────────────────────────────────────────
+static void FetchMedia() {
+    try {
+        auto ses = SelectSession();
+
+        if (!ses) {
+            // No media source available.
+            MediaWriter w;
+            w->playing = false;
+            w->hasMedia = false;
+            g_Vol.cachedIface = nullptr;
+            g_Vol.cachedAumid.clear();
+            return;
+        }
+
+        // ── Media properties ─────────────────────────────────────────────────
+        GlobalSystemMediaTransportControlsSessionMediaProperties props =
+            nullptr;
+        try {
+            props = ses.TryGetMediaPropertiesAsync().get();
+        }
+        WH_CATCH(L"FetchMedia/TryGetMediaPropertiesAsync")
+
+        if (!props) {
+            Wh_Log(L"[FetchMedia] null props — marking paused");
+            MediaWriter w;
+            w->playing = false;
+            return;
+        }
+
+        try {
+            g_currentMediaAppAumid = ses.SourceAppUserModelId().c_str();
+        }
+        WH_CATCH(L"FetchMedia/SourceAumid")
+        FetchAppVolume();
+
+        // ── Track-change detection & crossfade trigger ───────────────────────
+        // All crossfade state lives in g_Anim.crossfade; FetchMedia only calls
+        // RequestSwap() — it never touches g_Anim.crossfade.alpha/fadeOut
+        // directly.  This is the ownership boundary that was previously
+        // blurred.
+        wstring nt =
+            WH_TRY_OR(wstring(props.Title().c_str()), wstring(L"Unknown"));
+
+        bool trackChanged;
+        {
+            MediaReader r;
+            trackChanged = (nt != r->title || !g_M.art);
+        }
+
+        if (trackChanged) {
+            wstring newArtist =
+                WH_TRY_OR(wstring(props.Artist().c_str()), wstring(L""));
+
+            // Only arm a crossfade when there was a real previous track.
+            bool hadMedia;
+            {
+                MediaReader r;
+                hadMedia = (r->title != L"No Media");
+            }
+            if (hadMedia) {
+                g_Anim.crossfade.RequestSwap(nt, newArtist);
+                // RequestSwap is idempotent; arming the timer on every call is
+                // safe because TimerSet::Set() is idempotent too.
+                if (g_hWnd)
+                    g_Timers.Set(g_hWnd, IDT_TEXT_FADE, 16);
+            }
+
+            // Decode new art (ml-only fields — no lock).
+            FetchAlbumArt(props);
+        }
+
+        // Commit title/artist immediately when no crossfade is pending.
+        // When a crossfade IS running, the IDT_TEXT_FADE tick commits the
+        // pending strings once alpha reaches zero — never FetchMedia.
+        // Only write title/artist immediately when no crossfade fade-out is
+        // running.  If one IS running, TextCrossfade::Tick() will commit the
+        // pending strings at the moment alpha reaches zero.
+        if (!g_Anim.crossfade.active || !g_Anim.crossfade.fadeOut) {
+            MediaWriter w;
+            w->title = nt;
+            w->artist =
+                WH_TRY_OR(wstring(props.Artist().c_str()), wstring(L""));
+        }
+
+        // ── Playback + timeline
+        // ───────────────────────────────────────────────
+        FetchPlaybackState(ses);
+        FetchTimeline(ses);
+
+        {
+            MediaWriter w;
+            w->hasMedia = true;
+        }
+    }
+    WH_CATCH(L"FetchMedia/outer")
 }
 
 static void Cmd(MediaCmd c) {
@@ -2339,44 +2537,42 @@ static void Cmd(MediaCmd c) {
                 try {
                     bool cur;
                     {
-                        scoped_lock lk(g_M.mtx);
-                        cur = g_M.shuffleOn;
+                        MediaReader r;
+                        cur = r->shuffleOn;
                     }
                     s.TryChangeShuffleActiveAsync(!cur);
-                } catch (...) {
                 }
+                WH_CATCH(L"Cmd/Shuffle")
                 break;
             case MediaCmd::Repeat:
                 try {
                     int cur;
                     {
-                        scoped_lock lk(g_M.mtx);
-                        cur = g_M.repeatMode;
+                        MediaReader r;
+                        cur = r->repeatMode;
                     }
                     using RM = Windows::Media::MediaPlaybackAutoRepeatMode;
                     RM next = (cur == 0)   ? RM::Track
                               : (cur == 1) ? RM::List
                                            : RM::None;
                     s.TryChangeAutoRepeatModeAsync(next);
-                } catch (...) {
                 }
+                WH_CATCH(L"Cmd/Repeat")
                 break;
             default:
                 break;
         }
-    } catch (...) {
     }
+    WH_CATCH(L"Cmd/outer")
 }
 
 // ============================================================================
-//  Timer rate management
-// ============================================================================
 
 static void ApplyTimerRates(HWND hwnd) {
-    bool playing = false;
+    bool playing;
     {
-        scoped_lock lk(g_M.mtx);
-        playing = g_M.playing;
+        MediaReader r;
+        playing = r->playing;
     }
     g_Timers.Set(hwnd, IDT_POLL,
                  playing ? POLL_RATE_PLAYING : POLL_RATE_PAUSED);
@@ -2788,7 +2984,7 @@ static DrawCtx MakeDrawCtx(Graphics& g,
                            Bitmap*& art_out,
                            bool& playing_out) {
     {
-        scoped_lock lk(g_M.mtx);
+        MediaReader _mr_;
         title_out = idleState ? L"Title" : g_M.title;
         artist_out = idleState ? L"Author" : g_M.artist;
         playing_out = g_M.playing;
@@ -2946,7 +3142,7 @@ static void DrawBackground(DrawCtx& ctx) {
             break;
         }
         case Theme::AlbumBlur: {
-            scoped_lock lk(g_M.mtx);
+            MediaReader _mr_;
             if (g_M.art)
                 UpdateAlbumBlurBg(g_M.art.get(), W, H, g_ArtVersion);
             if (g_BlurCache.bitmap)
@@ -3205,7 +3401,7 @@ static void DrawInfoContainer(DrawCtx& ctx) {
             dispArtist = TruncateToFit(ctx.artist, artistF, tW);
     }
 
-    float alpha = g_Anim.textFadeAlpha;
+    float alpha = g_Anim.crossfade.alpha;
     Color tcFaded(max(0, (int)(ctx.textColor.GetA() * alpha)),
                   ctx.textColor.GetR(), ctx.textColor.GetG(),
                   ctx.textColor.GetB());
@@ -3503,7 +3699,7 @@ static void DrawControlsContainer(DrawCtx& ctx) {
     bool shOn = false;
     int repMode = 0;
     {
-        scoped_lock lk(g_M.mtx);
+        MediaReader _mr_;
         shOn = g_M.shuffleOn;
         repMode = g_M.repeatMode;
     }
@@ -3742,7 +3938,7 @@ static void DrawPanel(HDC hdc, int W, int H) {
     // Palette from album art
     Color bgPrimary, bgSecondary;
     {
-        scoped_lock lk(g_M.mtx);
+        MediaReader _mr_;
         bgPrimary = g_M.primaryColor;
         bgSecondary = g_M.secondaryColor;
     }
@@ -4025,7 +4221,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_BlurCache.Invalidate();
 
             {
-                scoped_lock lk(g_M.mtx);
+                MediaReader _mr_;
                 g_M.art.reset();
             }
             DestroyBackBuffer();
@@ -4073,7 +4269,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                     // Idle screen
                     {
-                        scoped_lock lk(g_M.mtx);
+                        MediaReader _mr_;
                         if (g_US.idleScreenEnabled && !g_M.hasMedia) {
                             if (++g_NoMediaSecs >= g_US.idleScreenDelay)
                                 g_IdleState = true;
@@ -4086,7 +4282,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_US.idleTimeout > 0) {
                         bool isPlaying;
                         {
-                            scoped_lock lk(g_M.mtx);
+                            MediaReader _mr_;
                             isPlaying = g_M.playing;
                         }
                         if (!isPlaying) {
@@ -4199,8 +4395,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             if (!ses)
                                 try {
                                     ses = g_Mgr.GetCurrentSession();
-                                } catch (...) {
                                 }
+                            WH_CATCH(L"IDT_POS/GetCurrentSession")
                             if (ses) {
                                 auto tl = ses.GetTimelineProperties();
                                 auto pbi = ses.GetPlaybackInfo();
@@ -4220,10 +4416,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 }
                                 InvalidateRect(hwnd, NULL, FALSE);
                             }
-                        } catch (...) {
                         }
-                    }
-                    // Scroll animation
+                        WH_CATCH(L"IDT_POS/timeline")
+                    }  // if (g_US.showProgressBar && g_Mgr)
                     if (g_Scroll.active) {
                         if (g_Scroll.waitTicks > 0) {
                             --g_Scroll.waitTicks;
@@ -4320,25 +4515,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
 
                 case IDT_TEXT_FADE: {
-                    if (g_Anim.textFadeOut) {
-                        g_Anim.textFadeAlpha -= 0.12f;
-                        if (g_Anim.textFadeAlpha <= 0.f) {
-                            g_Anim.textFadeAlpha = 0.f;
-                            g_Anim.textFadeOut = false;
-                            {
-                                scoped_lock lk(g_M.mtx);
-                                g_M.title = g_Anim.pendingTitle;
-                                g_M.artist = g_Anim.pendingArtist;
-                            }
+                    // Delegate entirely to TextCrossfade::Tick().
+                    // Tick() returns true if a repaint is needed (always while
+                    // active).  When it reports a commit, we write those
+                    // strings to g_M under its mutex — the only place that
+                    // happens.
+                    if (g_Anim.crossfade.active) {
+                        TextCrossfade::CommitData commit;
+                        bool needRepaint = g_Anim.crossfade.Tick(&commit);
+                        if (!commit.title.empty()) {
+                            MediaWriter w;
+                            w->title = commit.title;
+                            w->artist = commit.artist;
                         }
-                    } else {
-                        g_Anim.textFadeAlpha += 0.12f;
-                        if (g_Anim.textFadeAlpha >= 1.f) {
-                            g_Anim.textFadeAlpha = 1.f;
+                        if (!g_Anim.crossfade.active)
                             g_Timers.Kill(IDT_TEXT_FADE);
-                        }
+                        if (needRepaint)
+                            InvalidateRect(hwnd, NULL, FALSE);
+                    } else {
+                        g_Timers.Kill(IDT_TEXT_FADE);
                     }
-                    InvalidateRect(hwnd, NULL, FALSE);
                     break;
                 }
 
